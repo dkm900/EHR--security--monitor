@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EHR Security Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="aurora" aria-hidden="true">
+  <span class="blob b1"></span>
+  <span class="blob b2"></span>
+  <span class="blob b3"></span>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="pulse-ring"><span></span></div>
+    <div>
+      <h1>EHR Security Monitor</h1>
+      <p class="sub">Access auditing &amp; anomaly detection &middot; prototype</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div class="chain-badge" id="chainBadge" title="Audit log hash-chain integrity">
+      <span class="dot"></span><span id="chainText">chain &mdash;</span>
+    </div>
+    <button class="btn btn-ghost" id="resetBtn">Reset state</button>
+    <label class="switch" title="Pause live updates">
+      <input type="checkbox" id="liveToggle" checked>
+      <span class="slider"></span>
+      <span class="switch-label">Live</span>
+    </label>
+  </div>
+</header>
+
+<!-- ===================== KPI ROW ===================== -->
+<section class="kpi-row">
+  <div class="kpi">
+    <div class="kpi-icon crit"><svg viewBox="0 0 24 24"><path d="M12 2 1 21h22L12 2Zm0 6h1.5v7H12V8Zm0 9h1.5v1.5H12V17Z"/></svg></div>
+    <div class="kpi-body">
+      <span class="kpi-value" id="kpiCritical">0</span>
+      <span class="kpi-label">Critical</span>
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-icon high"><svg viewBox="0 0 24 24"><path d="M12 2 1 21h22L12 2Zm0 6h1.5v7H12V8Zm0 9h1.5v1.5H12V17Z"/></svg></div>
+    <div class="kpi-body">
+      <span class="kpi-value" id="kpiHigh">0</span>
+      <span class="kpi-label">High</span>
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-icon med"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm1 15h-2v-2h2v2Zm0-4h-2V7h2v6Z"/></svg></div>
+    <div class="kpi-body">
+      <span class="kpi-value" id="kpiMedium">0</span>
+      <span class="kpi-label">Medium</span>
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-icon reads"><svg viewBox="0 0 24 24"><path d="M4 4h16v2H4V4Zm0 5h16v2H4V9Zm0 5h11v2H4v-2Zm0 5h16v2H4v-2Z"/></svg></div>
+    <div class="kpi-body">
+      <span class="kpi-value" id="kpiReads">0</span>
+      <span class="kpi-label">Records read</span>
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-icon exempt"><svg viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5l-8-3Zm-1 14-4-4 1.4-1.4L11 13.2l4.6-4.6L17 10l-6 6Z"/></svg></div>
+    <div class="kpi-body">
+      <span class="kpi-value" id="kpiExempt">0</span>
+      <span class="kpi-label">Exempt (rounds)</span>
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-icon denied"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm4 13.6L14.6 17 12 14.4 9.4 17 8 15.6 10.6 13 8 10.4 9.4 9 12 11.6 14.6 9 16 10.4 13.4 13 16 15.6Z"/></svg></div>
+    <div class="kpi-body">
+      <span class="kpi-value" id="kpiDenied">0</span>
+      <span class="kpi-label">Denied</span>
+    </div>
+  </div>
+</section>
+
+<main class="grid">
+
+  <!-- ===================== LEFT COLUMN ===================== -->
+  <div class="col-left">
+
+    <!-- Scenario launcher -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Scenario launcher</h2>
+        <p>Replay realistic traffic to see each rule fire &mdash; or stay quiet.</p>
+      </div>
+      <div class="scenario-grid" id="scenarioGrid"></div>
+    </section>
+
+    <!-- Access simulator -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Access simulator</h2>
+        <p>Act as any staff member and try to open charts.</p>
+      </div>
+
+      <div class="form-grid">
+        <label class="field">
+          <span>Acting as</span>
+          <select id="selUser"></select>
+        </label>
+
+        <label class="field">
+          <span>Action</span>
+          <select id="selAction">
+            {% for a in actions %}<option value="{{ a }}">{{ a }}</option>{% endfor %}
+          </select>
+        </label>
+
+        <label class="field">
+          <span>Source IP</span>
+          <input id="inpIp" type="text" value="10.20.4.88">
+        </label>
+
+        <label class="field">
+          <span>Password <em>(try <code>correct-horse</code>)</em></span>
+          <input id="inpPassword" type="text" value="correct-horse">
+        </label>
+      </div>
+
+      <div class="row-btns">
+        <button class="btn btn-primary" id="btnLogin">Attempt login</button>
+        <button class="btn btn-accent" id="btnOpenSelected">Open selected charts</button>
+        <button class="btn btn-ghost" id="btnClearSel">Clear selection</button>
+      </div>
+
+      <div class="scope-hint" id="scopeHint"></div>
+      <div class="verdict" id="verdict" hidden></div>
+    </section>
+
+    <!-- Record portal -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Patient records</h2>
+        <p>Tick charts to stage an access attempt. <span id="selCount" class="count-pill">0 selected</span></p>
+      </div>
+
+      <div class="filter-row">
+        <input id="inpSearch" type="search" placeholder="Search patient name&hellip;" autocomplete="off">
+        <select id="selDept">
+          <option value="">All departments</option>
+          {% for d in departments %}<option value="{{ d }}">{{ d }}</option>{% endfor %}
+        </select>
+        <select id="selCat">
+          <option value="">All sections</option>
+          {% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+        </select>
+        <select id="selLimit">
+          <option value="25">25 rows</option>
+          <option value="60" selected>60 rows</option>
+          <option value="120">120 rows</option>
+        </select>
+      </div>
+
+      <div class="table-wrap">
+        <table class="records">
+          <thead>
+            <tr>
+              <th class="tick"></th>
+              <th>Patient</th>
+              <th>MRN</th>
+              <th>Age</th>
+              <th>Department</th>
+              <th>Sections</th>
+            </tr>
+          </thead>
+          <tbody id="recordBody"></tbody>
+        </table>
+      </div>
+      <div class="table-foot">
+        <span id="recordMeta"></span>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===================== RIGHT COLUMN ===================== -->
+  <div class="col-right">
+
+    <section class="card alerts-card">
+      <div class="card-head row-between">
+        <div>
+          <h2>Alerts</h2>
+          <p>De-duplicated per rule &amp; user.</p>
+        </div>
+        <button class="btn btn-ghost sm" id="ackAllBtn">Ack all</button>
+      </div>
+      <div id="alertList" class="alert-list"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Audit trail</h2>
+        <p>Every access attempt, newest first.</p>
+      </div>
+      <div class="legend">
+        <span class="lg lg-ok">success</span>
+        <span class="lg lg-denied">denied</span>
+        <span class="lg lg-failed">failed</span>
+        <span class="lg lg-exempt">exempt</span>
+      </div>
+      <div id="auditList" class="audit-list"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Detection rules</h2>
+        <p>What this prototype watches for.</p>
+      </div>
+      <div id="ruleList" class="rule-list"></div>
+    </section>
+  </div>
+</main>
+
+<div id="toasts" class="toasts"></div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

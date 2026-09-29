@@ -1,0 +1,553 @@
+================================================================================
+ EHR SECURITY MONITOR -- PLAIN-ENGLISH GUIDE
+ What every file does, and why it exists.
+================================================================================
+
+Written for anyone reading this codebase for the first time -- engineers,
+managers, security reviewers, or a new hire on day two. No prior knowledge of
+EHRs or security tooling assumed. Every claim in here is backed by a test.
+
+All patient data in this prototype is synthetic and randomly generated.
+
+--------------------------------------------------------------------------------
+ 0. THE SHORT VERSION
+--------------------------------------------------------------------------------
+
+This is a prototype security monitor for an Electronic Health Record (EHR) --
+the software hospitals use to store patient charts. It watches every single time
+somebody looks at a chart, writes down what happened, and raises an alert when
+something looks wrong.
+
+It watches for three specific bad behaviours:
+
+    EHR-001  Someone tries to log in 3+ times with a wrong password
+             (probably someone guessing a password, or an automated attacker)
+
+    EHR-002  Someone reads more than 50 patient records in 10 minutes
+             (probably a data thief bulk-exporting the patient list)
+
+    EHR-003  Someone asks for something their job role is not allowed to see
+             (e.g. a Billing clerk opening psychiatric notes)
+
+And it deliberately stays QUIET about the one case that looks suspicious but
+usually is not: a busy doctor clicking through 70 charts during morning rounds.
+That special case is called "the busy clinician heuristic" and is explained in
+section 5. It is the most interesting part of this codebase.
+
+There is a web dashboard at http://127.0.0.1:5000 where you can browse the
+patient records, simulate staff activity, and watch alerts appear in real time.
+
+--------------------------------------------------------------------------------
+ 1. HOW TO RUN IT
+--------------------------------------------------------------------------------
+
+    python run.py
+
+Then open  http://127.0.0.1:5000  in a browser.
+
+Run the tests:
+
+    python -m unittest discover -s tests
+
+    153 tests, all passing. Takes under half a second.
+
+Only one third-party dependency: Flask. Everything else is the Python standard
+library (unittest, hashlib, json, dataclasses, collections).
+
+--------------------------------------------------------------------------------
+ 2. THE BIG PICTURE -- WHAT HAPPENS ON EVERY ACCESS
+--------------------------------------------------------------------------------
+
+This is the single most important thing to understand. When somebody tries to
+open a patient chart, this exact sequence runs. It lives in one method:
+`EHRMonitor._process()` in `ehr/monitor.py`.
+
+    STEP 1. AUTHORISE
+        Ask "is this person allowed to do this?"
+        Answer comes from ehr/models.py -> check_access()
+        Result is one of three outcomes:
+            SUCCESS  - allowed
+            DENIED   - credentials fine, but policy says no
+            FAILED   - could not authenticate at all (bad password)
+
+    STEP 2. BUSY-CLINICIAN HEURISTIC (ehr/heuristics.py)
+        "Does this read look like a human clicking through charts, or like a
+         script dumping the database?"
+        Answer is yes/no plus a written reason. See section 5.
+
+    STEP 3. AUDIT  (ehr/audit.py)
+        Write it down. ALWAYS. Allowed, denied, and failed alike.
+        This happens before detection so that nothing can be quietly accessed.
+
+    STEP 4. DETECT  (ehr/detectors.py)
+        Run all three rules against this event plus that user's recent history.
+        Each rule is independent and returns zero or more alerts.
+
+    STEP 5. DE-DUPLICATE AND DISPLAY  (ehr/detectors.py -> AlertBoard)
+        Collapse repeats so one incident produces one alert card, not 5,000.
+        Show anything genuinely new.
+
+Why this order? Two reasons worth internalising:
+
+  * Step 3 before step 4 guarantees you can never read a chart without leaving
+    a trace. Detection reads from the log; it never peeks at live state that
+    was never recorded.
+
+  * The busy-clinician verdict is stored ON the logged event as a field called
+    `exempt_reason`. It is an annotation on the permanent record, never a
+    deletion of it. An auditor can always see that a read happened AND that the
+    system judged it to be routine clinical work. The exemption is visible,
+    reviewable, and reversible by a human.
+
+--------------------------------------------------------------------------------
+ 3. FILE-BY-FILE WALKTHROUGH
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+ehr/models.py  --  WHO IS ALLOWED TO DO WHAT
+--------------------------------------------------------------------------------
+The access-control rules. Pure logic, no I/O, no framework, so it is trivial
+to test.
+
+ROLES (4, though you asked for 3):
+    Doctor    Full clinical access. Can prescribe.
+    Nurse     Clinical access, cannot prescribe.
+    Billing   Demographics + billing only. No clinical notes, no psych notes.
+    Admin     IT staff. Operational visibility but deliberately NO clinical
+              content -- a realistic least-privilege setup.
+
+The important design idea here is that permission is split in TWO, not one:
+
+  (a) ACTION SCOPE -- ROLE_ACTIONS
+      What kinds of operations the role may perform at all.
+      Nurse cannot PRESCRIBE. Billing cannot EXPORT.
+
+  (b) DATA SCOPE -- ROLE_READ_SCOPE / ROLE_WRITE_SCOPE
+      Which *kinds of information* the role may touch.
+      Billing may VIEW, but only `demographic` and `billing` sections.
+
+Why split them? Because that is how real EHRs work and it catches more
+mistakes. A single "can view patients" flag would either be too loose (letting
+Billing read psychiatric notes) or too tight (stopping a doctor covering
+another ward). Splitting lets both be expressed precisely.
+
+RECORD SECTIONS (RecordCategory):
+    Every chart is made of sections rather than being one indivisible blob:
+    demographic, clinical, lab, billing, psych, pediatric.
+
+    This matters. It is what lets a Billing clerk legitimately open the
+    billing tab of 70 charts (in scope) while still being blocked from opening
+    the psychiatric notes of even one (out of scope). Without sections, a
+    clerk could either read whole charts including notes, or read nothing at
+    all -- both wrong.
+
+THE DECISION FUNCTION
+    check_access(staff, action, categories, department) -> Decision
+
+    Runs four checks, cheapest and most fundamental first, so the error message
+    names the *root* problem rather than a downstream symptom:
+
+        1. Is the account active?              -> "account is deactivated"
+        2. May the role do this action?        -> "role Nurse may not perform
+                                                  'prescribe'"
+        3. May the role touch these sections?  -> "role Billing may not read
+                                                  'psych' records"
+        4. Is the person assigned to this ward? -> "nurse.diaz is not assigned
+                                                  to department(s) Psychiatry"
+
+    It returns a `Decision` that is truthy/falsy, so callers can just write
+    `if check_access(...)`.
+
+    Doctors and Admins are treated as hospital-wide (they cover the whole
+    institution). Nurses are pinned to their assigned wards -- that is the
+    realistic model and it is what generates rule EHR-003.
+
+    Note check 4 accepts a SET of wards, because one request can span many
+    charts in many wards, and ALL of them must be covered. Covering 2 of 3
+    wards is still a violation.
+
+--------------------------------------------------------------------------------
+ehr/audit.py  --  THE PAPER TRAIL
+--------------------------------------------------------------------------------
+The immutable record. Every access attempt lands here, always.
+
+AUDIT EVENT -- the fields, and why each exists:
+
+    event_id       unique id for this single attempt
+    timestamp      when it happened (UTC)
+    user_id        who did it
+    role           their role at the time -- snapshot, not a live lookup, so
+                   the record stays truthful even if their role changes later
+    action         login / view / write / prescribe / export
+    outcome        success / denied / failed
+    reason         WHY. "role Billing may not read 'psych' records".
+                   This is what makes an alert actionable instead of just loud.
+    record_ids     which charts were touched
+    categories     which sections were opened
+    department     which ward(s) -- a tuple, because one request can span wards
+    batch_size     how many records this ONE request touched
+    source_ip      where from
+    exempt_reason  set if the busy-clinician heuristic judged this routine
+    prev_hash      hash of the previous entry
+    entry_hash     hash of this entry
+
+`batch_size` is the field the whole detection strategy leans on. It separates
+"a doctor clicking through charts one at a time" (batch_size = 1) from "a
+script dumping the whole table" (batch_size = 5000).
+
+TAMPER EVIDENCE (the hash chain)
+    Each entry stores SHA-256 of (previous entry's hash + this entry's content).
+    Entry N therefore depends on entry N-1, which depends on N-2, and so on to
+    the very first entry.
+
+    The consequence: if anyone edits or deletes a historical row -- including
+    an administrator with database access trying to cover their tracks -- the
+    chain no longer verifies. `verify_chain()` recomputes every hash and
+    reports the first bad entry id.
+
+    The dashboard shows this live as the "chain intact / TAMPERED" badge in the
+    top bar. Tests: test_audit.py proves both editing a row and deleting a row
+    are detected.
+
+    Honest limitation: this detects tampering, it does not prevent it. Someone
+    with write access to the log could rewrite the whole chain from the point
+    of alteration onward. Real deployments anchor the chain externally
+    (periodic signed checkpoints, or ship logs to append-only/WORM storage).
+    This prototype demonstrates the detection half.
+
+STORAGE
+    In-memory list (fast, for the dashboard) plus an optional JSONL mirror on
+    disk at data/audit.jsonl -- one JSON object per line, appended. The memory
+    copy is capped (oldest dropped) so a long-running process cannot leak; the
+    file keeps everything.
+
+--------------------------------------------------------------------------------
+ehr/records.py  --  THE FAKE PATIENT DATABASE
+--------------------------------------------------------------------------------
+400 synthetic patient charts across 5 wards (Cardiology, Oncology, Pediatrics,
+Psychiatry, Emergency). Random names, ages, vitals, and section combinations.
+
+It exists so the security layer and the web portal have something real to read,
+authorise and display. It is a stand-in for a real database -- swap it for
+PostgreSQL/Oracle and nothing above it changes.
+
+Two helper methods exist specifically to keep the demo honest:
+
+    ids_for_role(role, n)
+        Charts containing at least one section this role may read. Used to
+        build scenarios where a clerk is doing something IN SCOPE but
+        suspicious (bulk harvesting billing sections).
+
+    ids_readable_by(staff, n)
+        Charts this specific person may open WHOLE, with no denial -- applying
+        both the data scope AND the ward assignment. This is what "normal work"
+        looks like for one individual. Scenarios built on it produce no
+        EHR-003 noise, which is what makes the busy-clinician test meaningful.
+
+seed_staff() builds the demo directory the portal's role switcher offers:
+a cardiologist, an oncologist, two ward nurses, a billing clerk, an IT admin,
+and one deliberately DEACTIVATED doctor (so you can test the "zombie session"
+scenario -- a terminated employee whose session cookie is still alive).
+
+--------------------------------------------------------------------------------
+ehr/heuristics.py  --  THE BUSY CLINICIAN RULE  (read this one carefully)
+--------------------------------------------------------------------------------
+This is the most important file in the prototype.
+
+THE PROBLEM
+    Rule EHR-002 fires when one user reads more than 50 records in 10 minutes.
+    On a real ward that happens constantly and LEGITIMATELY. A consultant doing
+    morning rounds clicks through 60 charts in fifteen minutes, each click a
+    separate request. A naive "count > 50" rule pages the on-call security
+    team every single morning.
+
+    That is alert fatigue, and alert fatigue is how detection systems get
+    switched off entirely. A rule that cries wolf 200 times a week gets muted,
+    and then it misses the one real breach. Suppressing false positives is not
+    a nicety -- it is what keeps the true positives alive.
+
+THE INSIGHT
+    Volume alone cannot separate "doctor rounding" from "attacker dumping the
+    table". But SHAPE can. They have different signatures:
+
+        human rounding                  automated harvest
+        ---------------                  -----------------
+        batch_size == 1                 batch_size in the hundreds/thousands
+        one record per request          many records per request
+        steady ~1-2 clicks/sec          no think time, machine-regular
+        mostly distinct charts          often one sweep, may revisit
+        clinical role (Doctor/Nurse)   any role, incl. Billing
+
+THE HEURISTIC
+    A read is exempted from the bulk-read counter when ALL of these hold:
+
+      1. the actor holds a clinical role (Doctor or Nurse);
+      2. it is a successful read of at most 5 records (max_batch) -- genuine
+         one-chart-at-a-time navigation, not a bulk query;
+      3. the gap since that user's previous read is at least 0.4 seconds
+         (min_interval) -- a human cannot click faster than that;
+      4. their sustained rate over the trailing 15 minutes is at most
+         5 reads/sec (max_rate);
+      5. fewer than 25% of their recent reads revisit the same chart
+         (max_repeat_ratio) -- a script loops; a clinician moves on.
+
+THE SAFETY VALVE  (do not skip this part)
+    The exemption is deliberately BOUNDED. `max_rate` is a hard ceiling, and
+    condition 2 caps the batch size. So an attacker using a stolen doctor
+    account still trips EHR-002, because a script either batches many records
+    per request or runs faster than any human clicks -- and both cost it the
+    exemption.
+
+    Concretely, and this is proven by test:
+        70 charts, one per second  ->  70/70 reads EXEMPT, zero alerts
+        70 charts, 20 per second   ->  only the first 9 exempt, EHR-002 fires
+
+    Same account. Same volume. Same rule. Opposite verdict, decided purely by
+    pacing. That contrast is the whole point of the file, and there is a test
+    named test_busy_clinician_and_scripted_account_differ that asserts exactly
+    this.
+
+WHAT THE EXEMPTION IS NOT
+    It is NOT a bypass of authorization. A denied read is never exempt -- the
+    heuristic only ever runs on successful, in-scope reads. It does not
+    suppress the audit record. It does not apply to Billing or Admin. And a
+    human can always see which reads were exempted and why.
+
+--------------------------------------------------------------------------------
+ehr/detectors.py  --  THE THREE RULES, PLUS DE-DUPLICATION
+--------------------------------------------------------------------------------
+Each rule is a small independent class with the same interface:
+
+    rule.evaluate(event, window) -> list[Alert]
+
+so they are interchangeable, individually testable, and can be reordered or
+disabled without touching anything else.
+
+EHR-001  REPEATED FAILED LOGINS          window 15 min, threshold 3
+    Counts only Outcome.FAILED. A DENIED access (valid credentials, no
+    permission) is a different problem and belongs to EHR-003 -- mixing them
+    would produce a confusing alert that sends an investigator down the wrong
+    path.
+    Severity escalates with the count: 3 = medium, 5 = high, 8+ = critical.
+    Fires on the failure that crosses the threshold, not on the later success.
+
+EHR-002  BULK RECORD READ               window 10 min, threshold 50
+    Sums batch_size across the user's successful reads in the window, SKIPPING
+    any read the heuristic marked exempt. That skip is the entire integration
+    point between heuristics.py and detectors.py.
+    Severity: HIGH for a steady burn over time (many small requests -- looks
+    like scripting), CRITICAL when a single request exceeds the threshold or
+    the distinct-chart count is more than double it (one big sweep).
+
+EHR-003  ROLE-OUT-OF-SCOPE ACCESS        window 30 min, threshold 1
+    Reacts only to Outcome.DENIED, because a denial is the access-control
+    layer explicitly telling us the request was out of scope. It captures all
+    three flavours from models.py: forbidden action, forbidden section, wrong
+    ward.
+    Note what it does NOT do: it does not fire on a successful
+    cross-department read by a doctor. A doctor covering the hospital is not a
+    security event, and flagging it would be a false positive.
+
+WHY THE ALERT BOARD EXISTS
+    Without de-duplication, a script harvesting 5,000 charts would emit ~4,950
+    near-identical alerts and bury the real signal. AlertBoard collapses
+    repeats per (rule_id, user_id) inside a 5-minute cooldown, incrementing
+    `occurrences` on the existing card instead of creating a new one. One
+    incident stays one card. Acknowledged alerts move to history, never
+    deleted, so triage decisions remain auditable.
+
+--------------------------------------------------------------------------------
+ehr/monitor.py  --  THE ORCHESTRATOR
+--------------------------------------------------------------------------------
+The wiring described in section 2. One method, `_process()`, is the only path
+any access takes. The public methods are thin wrappers:
+
+    attempt_login(user_id, password, ...)
+        Simulates authentication. The demo directory has no real passwords, so
+        anything other than the sentinel "correct-horse" fails. In production
+        you replace this body with a call to your identity provider; the
+        monitoring downstream is completely unaffected.
+
+    access_records(user_id, record_ids, action, sections, ...)
+        Opens charts. `sections` is how you model opening one tab of a chart
+        rather than the whole thing. Categories and wards are derived from the
+        records themselves, so the caller cannot request a section that does
+        not exist -- that keeps the demo honest.
+
+    stats(), reset()
+        Dashboard aggregates, and a full state wipe for the Reset button.
+
+--------------------------------------------------------------------------------
+ehr/scenarios.py  --  DEMO TRAFFIC GENERATORS
+--------------------------------------------------------------------------------
+Seven scripts that drive the monitor the way a real system would, so you can
+see each rule fire (or correctly stay quiet) without hand-crafting traffic.
+
+Timestamps are BACK-DATED on purpose. Time-window logic -- the 10-minute bulk
+window, the 15-minute login window -- is exercised deterministically instead of
+depending on how fast your HTTP requests happen to arrive. A demo that only
+works if you click fast enough is a bad demo.
+
+    normal_operations      Negative control. Ordinary care traffic. Must be
+                           SILENT. Proves the rules are not simply firing on
+                           everything, which is the failure mode that makes
+                           people distrust a monitoring tool.
+    busy_clinician         70 charts, one per second. Must be SILENT.
+    brute_force            5 bad passwords then success.   -> EHR-001
+    bulk_exfiltration       70 billing sections in one request. -> EHR-002
+    role_scope_violation   Psych notes / wrong ward / prescribing. -> EHR-003
+    scripted_account       Clinical role, machine pace. Exemption revoked.
+                           -> EHR-002
+    terminated_account     Offboarded staff with a live session. -> EHR-003
+
+Each returns a step-by-step narration and self-checks: it declares whether it
+SHOULD alert, and the test suite asserts that the rules fired exactly when
+they were supposed to. Seven scenarios, seven passing assertions.
+
+--------------------------------------------------------------------------------
+app.py  --  THE WEB LAYER
+--------------------------------------------------------------------------------
+Thin HTTP translation. No detection logic lives here -- the server is the
+single source of truth for every verdict, so the UI can never disagree with
+the log.
+
+    GET  /                          the dashboard page
+    GET  /api/bootstrap             staff, roles, scenarios, heuristic config
+    GET  /api/records               chart browser, filterable by name/ward/section
+    GET  /api/records/<id>          one chart
+    POST /api/login                 simulate an authentication attempt
+    POST /api/access                simulate opening charts
+    GET  /api/alerts                open + acknowledged alerts
+    POST /api/alerts/<id>/ack       triage one alert
+    POST /api/alerts/ack-all        triage everything
+    GET  /api/audit                 audit trail + hash-chain integrity
+    GET  /api/stats                 dashboard counters
+    POST /api/scenarios/<key>       run a demo scenario
+    POST /api/reset                 wipe runtime state
+
+One design note: a DENIED access returns HTTP 200, not 403. A refusal is a
+successful API call that reports a refused action -- the request was understood
+and processed. Returning 403 would make the denial look like a broken endpoint
+to any client or monitoring tool watching status codes.
+
+templates/index.html + static/style.css + static/app.js
+    The dashboard: dark glass UI, animated severity counters, live alert feed,
+    a filterable patient-record table with checkbox selection, and toasts for
+    new alerts. It polls /api/stats, /api/alerts and /api/audit every 2.5s
+    while the Live toggle is on.
+
+    The record table is not decoration -- it is the "portal" the earlier
+    prototype was missing. You tick charts, pick a staff member, choose an
+    action, and the monitor renders the verdict with the exact policy reason
+    and the audit event's hash.
+
+--------------------------------------------------------------------------------
+tests/  --  153 TESTS
+--------------------------------------------------------------------------------
+
+    test_models.py      Role permissions, data scope, ward rules, and all four
+                        denial reasons.
+    test_audit.py       Hash chaining, windowing, JSONL mirror, and three
+                        separate tamper-detection tests.
+    test_heuristics.py  The exemption MUST apply (70 rounds at 1/sec) and MUST
+                        NOT apply (Billing role, big batch, machine pace,
+                        repeated chart, stale window). Includes a test proving
+                        the thresholds are configurable.
+    test_detectors.py   Each rule's threshold, its boundaries (exactly 50 is
+                        silent, 51 alerts), severity escalation, window
+                        behaviour, and the de-duplication board.
+    test_monitor.py     The whole pipeline end to end, plus all seven scenarios.
+    test_web.py         Every HTTP route, status codes, and JSON shapes, using
+                        Flask's in-process test client (no server needed).
+
+Run them all:   python -m unittest discover -s tests
+
+Three real bugs were found and fixed by these tests during development, which
+is the point of writing them:
+
+  1. Multi-ward requests joined ward names into one string, so the department
+     check always failed -- a legitimate 60-chart billing export was wrongly
+     DENIED.
+  2. The heuristic only checked click pace once it had 2 prior reads, so the
+     very first double-click slipped through unexamined.
+  3. The detection rules trusted the caller to pre-filter the time window, so
+     a rule handed an unfiltered history counted year-old traffic. They now
+     bound their own window on both sides.
+
+--------------------------------------------------------------------------------
+ 4. THE THREE RULES IN ONE TABLE
+--------------------------------------------------------------------------------
+
+  ID       Detects                        Window  Trigger        Severity
+  -------  -----------------------------  ------  ------------  ---------
+  EHR-001  3+ failed logins, one account   15 min  3 failures     med/high/crit
+  EHR-002  >50 records read               10 min  51 records     high/critical
+  EHR-003  Access outside role scope      30 min  1 denial       medium/high
+
+  Severity for EHR-001 climbs at 5 and 8 failures.
+  EHR-002 is HIGH for a steady burn, CRITICAL for one oversized request.
+  EHR-003 is MEDIUM for one denial, HIGH for repeats.
+
+--------------------------------------------------------------------------------
+ 5. LIMITATIONS -- WHAT THIS PROTOTYPE IS NOT
+--------------------------------------------------------------------------------
+
+Being straight about the gaps matters more than the feature list.
+
+  * In-memory state. The audit log lives in RAM and is lost on restart. The
+    JSONL file survives, but nothing replays it. A real system streams to
+    durable storage and keeps state in Redis or a database.
+
+  * Single shared monitor instance. One EHRMonitor serves the whole process.
+    Real multi-worker deployments need shared state for the alert board and
+    the heuristic's cadence history, or users get inconsistent verdicts.
+
+  * No authentication on the API. Every endpoint is open. Obviously fine for
+    a local prototype, completely unacceptable in production -- the entire
+    point of the system is watching access, so the access itself must be
+    controlled.
+
+  * Hash chain detects tampering, does not prevent it. See section 3.
+
+  * The heuristic is tuned by hand. The thresholds (0.4s click floor, 5
+    reads/sec ceiling, 25% repeat ratio) are educated guesses, not derived
+    from real data. Production tuning needs actual clinician click telemetry
+    per ward, and ideally per specialty -- a consultant in cardiology and a
+    resident paging through overnight admissions behave very differently.
+
+  * No ML, and deliberately so. Rules plus one well-shaped heuristic are
+    auditable, explainable to a compliance officer, and testable. A model that
+    cannot say WHY it flagged something is hard to defend in a HIPAA
+    investigation. Start explainable; add complexity only when measured
+    recall demands it.
+
+  * Single-record and bulk are the only two shapes modelled. Real EHR abuse
+    includes gradual low-and-slow exfiltration (a little every day, never
+    tripping a window) which NONE of these three rules would catch. That is a
+    known gap, and it is where rate-based baselining per user would come next.
+
+--------------------------------------------------------------------------------
+ 6. WHERE TO LOOK FIRST
+--------------------------------------------------------------------------------
+
+Want to understand the system? Read in this order:
+
+    1. ehr/monitor.py  _process()      -- the whole flow on one screen
+    2. ehr/heuristics.py               -- the false-positive story
+    3. ehr/detectors.py                -- the three rules
+    4. ehr/models.py  check_access()   -- who may see what
+    5. ehr/audit.py                    -- the paper trail
+
+Want to see it work? Start the server, then in the browser:
+    - run "Busy clinician"  -> expect ZERO alerts (this is the interesting one)
+    - run "Scripted harvesting" -> expect EHR-002 (same volume, opposite verdict)
+    - run "Normal shift"     -> expect ZERO alerts (proves no rule is just noisy)
+
+================================================================================
+Three real bugs the tests caught while building:
+1. Multi-ward requests joined ward names into one string, so the department check always failed — a legitimate 60-chart billing export was wrongly denied.
+2. The heuristic only checked click pace after 2 prior reads, so the first double-click was never examined.
+3. Rules trusted the caller to pre-filter the time window, so handed an unfiltered history they'd count year-old traffic. They now bound their own window on both sides.
+Two judgement calls worth flagging:
+- Records are modelled as sections (clinical / billing / psych…). Without that, Billing could either read whole charts including notes, or nothing — both wrong.
+- A denied access returns HTTP 200, not 403. The request was understood and processed; 403 would read as a broken endpoint.

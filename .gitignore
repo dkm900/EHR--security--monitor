@@ -1,0 +1,31 @@
+# Bytecode / build artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime audit data -- append-only log of access attempts.
+# Machine-specific and grows without bound; never commit it.
+data/
+*.jsonl
+
+# Secrets: this project needs none, so refuse them loudly if they appear.
+.env
+.env.*
+*.pem
+*.key
+secrets.py
+credentials.json
+
+# Tooling / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
